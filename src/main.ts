@@ -9,6 +9,7 @@ import utc from 'dayjs/plugin/utc'
 import timezone from 'dayjs/plugin/timezone'
 import type { DouyinCookie, SameSite } from './types/douyin-cookie'
 import type { Yiyan } from './types/yiyan'
+import { sendMessageAndVerify } from './send-message'
 
 dayjs.extend(utc)
 dayjs.extend(timezone)
@@ -157,11 +158,12 @@ async function runDouyinAccount(
       }
 
       await searchResult.getByText(/^(发消息|发私信)$/).click({ timeout: 5000 })
+      await waitForConversationTarget(page, targetName)
       console.log(`[${account.name}] 已打开私信：${targetName}`)
 
       const editorInput = page
         .locator(
-          '.messageEditorimChatEditorContainer [data-slate-editor="true"][contenteditable="true"]',
+          '.componentsRightPanelwrapper .messageEditorimChatEditorContainer [data-slate-editor="true"][contenteditable="true"]',
         )
         .first()
       await editorInput.waitFor({ state: 'visible', timeout: 10000 })
@@ -181,10 +183,39 @@ async function runDouyinAccount(
         message = includeYiyanSource ? `${yiyan.hitokoto}\n——「${yiyan.from}」` : yiyan.hitokoto
       }
 
-      await page.keyboard.insertText(message)
-      await page.keyboard.press('Enter')
-      console.log(`[${account.name}] 已发送消息：${targetName}`)
-      await page.waitForTimeout(1000)
+      try {
+        await sendMessageAndVerify({
+          page,
+          editorInput,
+          message,
+          reopenConversation: async () => {
+            await reopenConversationForVerification(page!, account.name, targetName)
+          },
+          openFreshConversation: async () => {
+            // Do not copy localStorage or IndexedDB: a failed local message can
+            // survive a reload without ever having reached the recipient.
+            const verificationContext = await browser.newContext()
+            try {
+              await verificationContext.addCookies(await context.cookies())
+              const verificationPage = await verificationContext.newPage()
+              await verificationPage.goto('https://www.douyin.com/chat', {
+                waitUntil: 'domcontentloaded',
+              })
+              await reopenConversationForVerification(verificationPage, account.name, targetName)
+              return {
+                page: verificationPage,
+                close: () => verificationContext.close(),
+              }
+            } catch (error) {
+              await verificationContext.close()
+              throw error
+            }
+          },
+        })
+      } catch (error) {
+        throw new Error(`[${targetName}] ${toError(error).message}`, { cause: error })
+      }
+      console.log(`[${account.name}] 已确认新消息在独立会话中存在：${targetName}`)
     }
 
     await page.waitForTimeout(5000)
@@ -206,6 +237,31 @@ async function runDouyinAccount(
       await context.close()
     }
   }
+}
+
+/** Confirm the real chat header, not the still-visible search result or previous editor. */
+async function waitForConversationTarget(page: Page, targetName: string): Promise<void> {
+  await page
+    .locator('#ei-conversation-header-info')
+    .getByText(targetName, { exact: true })
+    .waitFor({ state: 'visible', timeout: CHAT_PAGE_READY_TIMEOUT })
+}
+
+/** Open the target after a reload or inside a browser context without a message cache. */
+async function reopenConversationForVerification(
+  page: Page,
+  accountName: string,
+  targetName: string,
+): Promise<void> {
+  const searchInput = page.locator('input.semi-input[placeholder="搜索"]').first()
+  await searchInput.waitFor({ state: 'visible', timeout: CHAT_PAGE_READY_TIMEOUT })
+  await waitForChatListReady(page, accountName)
+  const result = await searchConversation(page, searchInput, accountName, targetName)
+  if (!result) {
+    throw new Error(`验证消息时无法重新打开会话：${targetName}`)
+  }
+  await result.getByText(/^(发消息|发私信)$/).click({ timeout: 5000 })
+  await waitForConversationTarget(page, targetName)
 }
 
 /**
